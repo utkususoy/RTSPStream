@@ -1,0 +1,27 @@
+app = FastAPI()
+controller = SinglePipelineController()
+
+
+@app.post("/pipeline/start")
+def start_pipeline(config: PipelineConfig):
+    try:
+        controller.start_async(config)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"status": PipelineState.STARTING}
+
+
+@app.post("/pipeline/stop")
+def stop_pipeline():
+    controller.stop()
+    return {"status": PipelineState.STOPPED}
+
+
+@app.get("/pipeline/status")
+def pipeline_status():
+    return controller.status()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    controller.stop()
