@@ -1,0 +1,197 @@
+import cv2
+import time
+import os
+import queue
+import threading
+import numpy as np
+from ultralytics import YOLO
+
+# ==============================
+# CONFIG
+# ==============================
+RTSP_URL = "rtsp://username:password@ip:port/stream"
+MODEL_PATH = "yolov8n.pt"
+TRACKER_YAML = "bytetrack.yaml"
+
+FIRST_N_FRAMES = 5
+ENV = "DEV"          # DEV or PROD
+OUTPUT_DIR = "output"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ==============================
+# QUEUES & EVENTS
+# ==============================
+frame_queue = queue.Queue(maxsize=1)
+io_queue = queue.Queue(maxsize=100)
+stop_event = threading.Event()
+
+# ==============================
+# UTILS
+# ==============================
+def blur_score(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+def quality_score(conf, bbox, blur):
+    x1, y1, x2, y2 = bbox
+    area = max((x2 - x1) * (y2 - y1), 1)
+    return conf * area * blur
+
+# ==============================
+# RTSP THREAD
+# ==============================
+def rtsp_reader():
+    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        print("[RTSP] Açılamadı")
+        stop_event.set()
+        return
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+
+        if frame_queue.full():
+            frame_queue.get_nowait()
+
+        frame_queue.put(frame)
+
+    cap.release()
+
+# ==============================
+# IO WORKER THREAD
+# ==============================
+def io_worker():
+    while not stop_event.is_set():
+        try:
+            event = io_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        track_id = event["track_id"]
+        image = event["image"]
+        meta = event["meta"]
+
+        if ENV == "DEV":
+            path = f"{OUTPUT_DIR}/track_{track_id}.jpg"
+            cv2.imwrite(path, image)
+            print(f"[DEV] Local write: {path}")
+
+        else:
+            # S3 UPLOAD (mock)
+            path = f"s3://bucket/track_{track_id}.jpg"
+            print(f"[PROD] S3 upload: {path}")
+
+        # Kafka publish (mock)
+        print(f"[KAFKA] Event sent → {meta}")
+
+# ==============================
+# INFERENCE THREAD
+# ==============================
+def inference_worker():
+    model = YOLO(MODEL_PATH).to("cuda")
+
+    tracks = {}  # track_id -> data
+
+    while not stop_event.is_set():
+        try:
+            frame = frame_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        results = model.track(
+            frame,
+            persist=True,
+            tracker=TRACKER_YAML,
+            verbose=False
+        )
+
+        boxes = results[0].boxes
+        if boxes.id is None:
+            continue
+
+        for box, track_id, conf in zip(boxes.xyxy, boxes.id, boxes.conf):
+            track_id = int(track_id)
+            conf = float(conf)
+
+            x1, y1, x2, y2 = map(int, box)
+            crop = frame[y1:y2, x1:x2].copy()
+            if crop.size == 0:
+                continue
+
+            blur = blur_score(crop)
+            score = quality_score(conf, (x1, y1, x2, y2), blur)
+
+            # -------------------------
+            # TRACK INIT
+            # -------------------------
+            if track_id not in tracks:
+                tracks[track_id] = {
+                    "count": 1,
+                    "best_score": score,
+                    "best_image": crop,
+                    "sent": False
+                }
+                continue
+
+            track = tracks[track_id]
+
+            if track["sent"]:
+                continue
+
+            track["count"] += 1
+
+            if score > track["best_score"]:
+                track["best_score"] = score
+                track["best_image"] = crop
+
+            # -------------------------
+            # FIRST N FRAME TAMAMLANDI
+            # -------------------------
+            if track["count"] >= FIRST_N_FRAMES:
+                io_queue.put({
+                    "track_id": track_id,
+                    "image": track["best_image"],
+                    "meta": {
+                        "track_id": track_id,
+                        "quality": track["best_score"],
+                        "timestamp": time.time()
+                    }
+                })
+                track["sent"] = True
+                print(f"[TRACK {track_id}] İlk {FIRST_N_FRAMES} frame tamam → IO gönderildi")
+
+        cv2.imshow("Tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            stop_event.set()
+            break
+
+    cv2.destroyAllWindows()
+
+# ==============================
+# MAIN
+# ==============================
+threads = [
+    threading.Thread(target=rtsp_reader, daemon=True),
+    threading.Thread(target=inference_worker, daemon=True),
+    threading.Thread(target=io_worker, daemon=True)
+]
+
+for t in threads:
+    t.start()
+
+try:
+    while not stop_event.is_set():
+        time.sleep(1)
+except KeyboardInterrupt:
+    stop_event.set()
+
+for t in threads:
+    t.join()
+
+print("Program kapandı.")
